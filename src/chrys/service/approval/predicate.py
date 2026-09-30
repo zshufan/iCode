@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Chrys. All rights reserved.
 
-"""Strict predicate assets, response validation, and fixed formal decisions."""
+"""Strict predicate assets, three-valued responses, and Formal routing."""
 
 from __future__ import annotations
 
@@ -9,12 +9,13 @@ import json
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib.resources import files
-from typing import Any
+from typing import Any, Literal
 
-_SCHEMA_VERSION = 1
-_DECISION_VERSION = "binary-predicate-v1"
+_DECISION_VERSION = "three-valued-or-v1"
 _MAX_PRINCIPLES = 32
 _MAX_TEXT_LENGTH = 4_000
+
+type TruthValue = bool | Literal["unknown"]
 
 
 class PredicateAssetError(ValueError):
@@ -22,17 +23,29 @@ class PredicateAssetError(ValueError):
 
 
 class PredicateDecision(StrEnum):
-    AUTO_APPROVE = "auto_approve"
+    REASONING = "reasoning"
     NEEDS_REVIEW = "needs_review"
 
 
 @dataclass(frozen=True, slots=True)
+class PrincipleExample:
+    """Immutable example data; result labels remain strings from the asset."""
+
+    prompt: str
+    toolcall: str
+    result: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class Principle:
-    """One stable, model-evaluated semantic condition."""
+    """One independent semantic condition, including its complete definition."""
 
     id: str
     role: str
     question: str
+    examples: tuple[PrincipleExample, ...]
+    exceptions: tuple[PrincipleExample, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,26 +61,18 @@ class PredicateAsset:
     def __post_init__(self) -> None:
         validate_asset_snapshot(self)
 
-    @property
-    def intents(self) -> tuple[Principle, ...]:
-        return tuple(principle for principle in self.principles if principle.role == "intent_match")
-
-    @property
-    def risks(self) -> tuple[Principle, ...]:
-        return tuple(principle for principle in self.principles if principle.role == "needs_review")
-
 
 @dataclass(frozen=True, slots=True)
 class PredicateValue:
-    """A validated Boolean predicate result."""
+    """A validated true, false, or unknown predicate result."""
 
     id: str
-    value: bool
+    value: TruthValue
 
 
 @dataclass(frozen=True, slots=True)
 class PredicateEvaluation:
-    """Result of strict parsing followed by the fixed decision table."""
+    """Result of strict parsing followed by the fixed routing decision."""
 
     decision: PredicateDecision
     reason: str
@@ -81,67 +86,39 @@ def load_default_asset() -> PredicateAsset:
 
 
 def parse_asset(raw: bytes | str) -> PredicateAsset:
-    """Validate an asset completely before exposing it to the evaluator."""
+    """Validate the complete array; no legacy schema or role classification."""
     try:
         value = json.loads(raw, object_pairs_hook=_reject_duplicate_object)
     except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PredicateAssetError("invalid predicate asset JSON") from exc
-    if not isinstance(value, dict) or set(value) != {
-        "schema_version",
-        "asset_version",
-        "decision_version",
-        "principles",
-        "project",
-    }:
-        raise PredicateAssetError("invalid predicate asset fields")
-    if (
-        type(value["schema_version"]) is not int
-        or value["schema_version"] != _SCHEMA_VERSION
-        or value["decision_version"] != _DECISION_VERSION
-    ):
-        raise PredicateAssetError("unsupported predicate asset version")
-    if not _valid_text(value["asset_version"]):
-        raise PredicateAssetError("predicate asset needs an asset_version")
-    if not _valid_text(value["project"]):
-        raise PredicateAssetError("predicate asset needs a project owner")
-    raw_principles = value["principles"]
-    if not isinstance(raw_principles, list) or not raw_principles or len(raw_principles) > _MAX_PRINCIPLES:
+    if not isinstance(value, list) or not 1 <= len(value) <= _MAX_PRINCIPLES:
         raise PredicateAssetError("predicate asset needs principles")
     principles: list[Principle] = []
-    ids: set[str] = set()
-    for item in raw_principles:
-        if not isinstance(item, dict) or set(item) != {"id", "role", "question"}:
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"id", "role", "question", "examples", "exceptions"}:
             raise PredicateAssetError("invalid principle fields")
-        identifier, role, question = (
-            item["id"],
-            item["role"],
-            item["question"],
-        )
-        if (
-            not _valid_text(identifier)
-            or identifier in ids
-            or not isinstance(role, str)
-            or role not in {"intent_match", "needs_review"}
-            or not _valid_text(question)
-        ):
-            raise PredicateAssetError("invalid principle definition")
-        ids.add(identifier)
-        principles.append(Principle(identifier, role, question))
-    roles = {principle.role for principle in principles}
-    if roles != {"intent_match", "needs_review"}:
-        raise PredicateAssetError("asset needs intent and review conditions")
+        groups: list[tuple[PrincipleExample, ...]] = []
+        for key in ("examples", "exceptions"):
+            examples = item[key]
+            if not isinstance(examples, list) or any(
+                not isinstance(example, dict) or set(example) != {"prompt", "toolcall", "result", "reason"}
+                for example in examples
+            ):
+                raise PredicateAssetError("invalid principle examples")
+            groups.append(tuple(PrincipleExample(**example) for example in examples))
+        principles.append(Principle(item["id"], item["role"], item["question"], *groups))
     digest_source = raw.encode("utf-8") if isinstance(raw, str) else raw
     return PredicateAsset(
-        asset_version=value["asset_version"],
-        decision_version=value["decision_version"],
-        project=value["project"],
+        asset_version="risk-predicates-v1",
+        decision_version=_DECISION_VERSION,
+        project="iCode",
         digest=asset_digest(digest_source),
         principles=tuple(principles),
     )
 
 
 def validate_predicate_response(text: str, asset: PredicateAsset) -> tuple[PredicateValue, ...]:
-    """Accept exactly one Boolean per principle, optionally in a JSON code fence."""
+    """Accept exactly one JSON boolean or literal \"unknown\" per principle."""
     lines = text.strip().splitlines()
     # Unwrap only one complete block; extra prose or nested blocks remain invalid.
     if len(lines) >= 3 and lines[0].strip().lower() in {"```", "```json"} and lines[-1].strip() == "```":
@@ -151,33 +128,25 @@ def validate_predicate_response(text: str, asset: PredicateAsset) -> tuple[Predi
     except (json.JSONDecodeError, PredicateAssetError) as exc:
         raise PredicateAssetError("invalid predicate response JSON") from exc
     expected = {principle.id for principle in asset.principles}
-    if not isinstance(data, dict) or set(data) != expected or any(type(data[key]) is not bool for key in expected):
-        raise PredicateAssetError("predicate response must contain one Boolean per required ID")
+    if not isinstance(data, dict) or set(data) != expected or any(not _valid_value(data[key]) for key in expected):
+        raise PredicateAssetError('predicate response must contain true, false, or "unknown" per required ID')
     return tuple(PredicateValue(principle.id, data[principle.id]) for principle in asset.principles)
 
 
 def decide_predicates(values: tuple[PredicateValue, ...], asset: PredicateAsset) -> PredicateEvaluation:
-    """Require review for any risk or a task mismatch; otherwise approve."""
+    """Any true requires human review; false/unknown proceeds to reasoning."""
     if (
         len(values) != len(asset.principles)
         or {value.id for value in values} != {principle.id for principle in asset.principles}
-        or any(type(value.value) is not bool for value in values)
+        or any(not _valid_value(value.value) for value in values)
     ):
         raise PredicateAssetError("invalid predicate values")
-    by_id = {value.id: value for value in values}
-    triggered = [
-        principle.id
-        for principle in asset.principles
-        if (principle.role == "needs_review" and by_id[principle.id].value)
-        or (principle.role == "intent_match" and not by_id[principle.id].value)
-    ]
+    triggered = [value.id for value in values if value.value is True]
     if triggered:
         return PredicateEvaluation(
             PredicateDecision.NEEDS_REVIEW, f"Requires human review: {', '.join(triggered)}.", values
         )
-    return PredicateEvaluation(
-        PredicateDecision.AUTO_APPROVE, "All task intent conditions are met without review risks.", values
-    )
+    return PredicateEvaluation(PredicateDecision.REASONING, "No predicate is true; reasoning review required.", values)
 
 
 def evaluate_predicate_response(text: str, asset: PredicateAsset) -> PredicateEvaluation:
@@ -200,18 +169,34 @@ def validate_asset_snapshot(asset: PredicateAsset) -> None:
         or len(asset.digest) != 64
         or any(character not in "0123456789abcdef" for character in asset.digest)
         or not isinstance(asset.principles, tuple)
-        or not 2 <= len(asset.principles) <= _MAX_PRINCIPLES
+        or not 1 <= len(asset.principles) <= _MAX_PRINCIPLES
         or any(
             not isinstance(principle, Principle)
-            or not _valid_text(principle.id)
-            or principle.role not in {"intent_match", "needs_review"}
+            or not all(_valid_text(text) for text in (principle.id, principle.role, principle.question))
+            or not all(_valid_examples(group) for group in (principle.examples, principle.exceptions))
             for principle in asset.principles
         )
         or len({principle.id for principle in asset.principles}) != len(asset.principles)
-        or {principle.role for principle in asset.principles} != {"intent_match", "needs_review"}
-        or any(not _valid_text(principle.question) for principle in asset.principles)
     ):
         raise PredicateAssetError("invalid Formal asset snapshot")
+
+
+def _valid_examples(examples: object) -> bool:
+    return (
+        isinstance(examples, tuple)
+        and bool(examples)
+        and all(
+            isinstance(example, PrincipleExample)
+            and all(_valid_text(text) for text in (example.prompt, example.toolcall, example.reason))
+            and isinstance(example.result, str)
+            and example.result in ("true", "false", "unknown")
+            for example in examples
+        )
+    )
+
+
+def _valid_value(value: object) -> bool:
+    return type(value) is bool or (isinstance(value, str) and value == "unknown")
 
 
 def _reject_duplicate_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

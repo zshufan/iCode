@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI
 
 from chrys.kernel import ChatResponse, Message, UsageDetails
-from chrys.service.approval.predicate import PredicateAsset
+from chrys.service.approval.predicate import PredicateAsset, TruthValue, _reject_duplicate_object
 from chrys.service.profiles.models.schema import ModelProfile
 
 
@@ -35,22 +37,31 @@ class JevPredicateClient:
         # already owns profile credentials, headers, proxy/TLS, timeouts and retries.
         if stream:
             raise ValueError("Jev predicate requests do not stream")
-        data = await self.client.post(
+        response = await self.client.post(
             "decisions",
-            cast_to=dict[str, Any],
+            cast_to=httpx.Response,
             body={
                 "model": self.model_id,
                 "state": {"messages": [{"role": m.role, "content": m.text} for m in messages]},
                 "questions": {
                     p.id: {
                         "type": "choice",
-                        "instructions": {"question": p.question},
-                        "criteria": {"true": "The condition holds.", "false": "The condition does not hold."},
+                        "instructions": asdict(p),
+                        "criteria": {
+                            "true": "The condition holds.",
+                            "false": "The condition does not hold.",
+                            "unknown": "The available input is insufficient to determine whether the condition holds.",
+                        },
                     }
                     for p in self.asset.principles
                 },
             },
         )
+        # Decode before the SDK collapses duplicate answer IDs into a dict.
+        try:
+            data = response.json(object_pairs_hook=_reject_duplicate_object)
+        except ValueError:
+            data = {}
         values = self._values(data)
         usage = data.get("usage") if isinstance(data, dict) else None
         tokens: UsageDetails = {}
@@ -71,17 +82,17 @@ class JevPredicateClient:
             model=self.model_id,
         )
 
-    def _values(self, data: Any) -> dict[str, bool]:
+    def _values(self, data: Any) -> dict[str, TruthValue]:
         answers = data.get("answers") if isinstance(data, dict) else None
         if not isinstance(answers, dict) or set(answers) != {p.id for p in self.asset.principles}:
             return {}
-        values = {}
+        values: dict[str, TruthValue] = {}
         for p in self.asset.principles:
             answer = answers[p.id]
             if not isinstance(answer, dict) or answer.get("type") != "choice":
                 return {}
             choice = answer.get("choice")
-            if choice not in ("true", "false"):
+            if choice not in ("true", "false", "unknown"):
                 return {}
-            values[p.id] = choice == "true"
+            values[p.id] = "unknown" if choice == "unknown" else choice == "true"
         return values
